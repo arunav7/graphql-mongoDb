@@ -1,19 +1,44 @@
+import { ApolloServer } from 'apollo-server-express';
+import cors from 'cors';
 import 'dotenv/config';
 import express from 'express';
-import { ApolloServer } from 'apollo-server-express';
 import mongoose from 'mongoose';
-import cors from 'cors';
 
+import { makeExecutableSchema } from '@graphql-tools/schema';
+import { useServer } from 'graphql-ws/use/ws';
+import { createServer } from 'http';
+import { WebSocketServer } from 'ws';
+import resolvers, { pubsub } from './graphql/resolvers.js';
 import typeDefs from './graphql/typeDefs.js';
-import resolvers from './graphql/resolvers.js';
+import BillingAccount from './models/BillingAccount.js';
+import User from './models/User.js';
 
 const startServer = async () => {
     const app = express();
-    app.use(cors());
-    const server = new ApolloServer({ typeDefs, resolvers, introspection: true });
+    app.use(
+        cors({
+            origin: '*',
+            methods: ['GET', 'POST', 'OPTIONS'],
+            allowedHeaders: ['Content-Type', 'Authorization'],
+        })
+    );
+    app.options('*', cors());
 
-    await server.start();
-    server.applyMiddleware({ app });
+    const httpServer = createServer(app);
+
+    const schema = makeExecutableSchema({ typeDefs, resolvers });
+
+    const apollo = new ApolloServer({ schema, introspection: true });
+
+    await apollo.start();
+    apollo.applyMiddleware({ app, path: '/graphql', cors: false });
+
+    const wsServer = new WebSocketServer({
+        server: httpServer,
+        path: '/graphql',
+    });
+
+    const serverCleanup = useServer({ schema }, wsServer);
 
     await mongoose.connect(process.env.MONGO_URI, {
         useNewUrlParser: true,
@@ -21,9 +46,45 @@ const startServer = async () => {
     });
     console.log('MongoDB connected');
 
-    app.listen({ port: 4000 }, () =>
-        console.log(`Server ready at http://localhost:4000${server.graphqlPath}`)
-    );
+    try {
+        const userStream = User.watch([], { fullDocument: 'default' });
+        userStream.on('change', async () => {
+            const [users, billingAccounts] = await Promise.all([
+                User.estimatedDocumentCount(),
+                BillingAccount.estimatedDocumentCount(),
+            ]);
+            pubsub.publish('COUNTS_UPDATED', { countsUpdated: { users, billingAccounts } });
+        });
+
+        const billingStream = BillingAccount.watch([], { fullDocument: 'default' });
+        billingStream.on('change', async () => {
+            const [users, billingAccounts] = await Promise.all([
+                User.estimatedDocumentCount(),
+                BillingAccount.estimatedDocumentCount(),
+            ]);
+            pubsub.publish('COUNTS_UPDATED', { countsUpdated: { users, billingAccounts } });
+        });
+    } catch (e) {
+        console.warn(
+            'Change Streams not available. Ensure MongoDB is a replica set / Atlas.\n',
+            e?.message
+        );
+    }
+
+    const PORT = process.env.PORT || 4000;
+    httpServer.listen(PORT, (data) => {
+        console.log('data ---', data);
+        console.log(`HTTP  ready at http://localhost:${PORT}${apollo.graphqlPath}`);
+        console.log(`WS    ready at ws://localhost:${PORT}${apollo.graphqlPath}`);
+    });
+
+    ['SIGINT', 'SIGTERM'].forEach((sig) => {
+        process.on(sig, async () => {
+            await serverCleanup.dispose();
+            await apollo.stop();
+            process.exit(0);
+        });
+    });
 };
 
 startServer();
